@@ -29,6 +29,7 @@ public:
         update();
     }
 
+    /** throttle input: 0 (max reverse), 1000 (max forward), 500 (stop) **/
     void setThrottle(int t) {
         if (t > 1000) {
             t = 1000;
@@ -46,7 +47,7 @@ public:
         pwm.pulsewidth_us(duty);
     }
 
-    void safe_off() {
+    void safeOff() {
         pwm.pulsewidth(0);
     }
 
@@ -57,30 +58,26 @@ class SUB {
 private:
     ESC& esc_left;
     ESC& esc_right;
+    bool _arm{false};
     int yaw_effort{0};
-    int thrust_effort{500};
+    int pitch_effort{500};
 
 public:
     SUB(ESC& left, ESC& right) : esc_left{left}, esc_right{right} {
         /** Some ESCs requires a initial "neutral" throttle signal to initialize **/
     }
 
-    void init() {
-        esc_left.init();
-        esc_right.init();
-    }
-
-    void set_thrust_effort(int thrust) {
-        if (thrust > 1000) {
-            thrust_effort = 1000;
-        } else if (thrust < 0) {
-            thrust_effort = 0;
+    void setPitchEffort(int pitch) {
+        if (pitch > 1000) {
+            pitch_effort = 1000;
+        } else if (pitch < -1000) {
+            pitch_effort = -1000;
         } else {
-            thrust_effort = thrust;
+            pitch_effort = pitch;
         }
     }
 
-    void set_yaw_effort(int yaw) {
+    void setYawEffort(int yaw) {
         if (yaw > 1000) {
             yaw_effort = 1000;
         } else if (yaw < -1000) {
@@ -90,29 +87,40 @@ public:
         }
     }
 
-    int get_thrust_effort() const {
-        return thrust_effort;
+    int getPitchEffort() const {
+        return pitch_effort;
     }
 
-    int get_yaw_effort() const {
+    int getYawEffort() const {
         return yaw_effort;
     }
 
     void update() {
-        esc_left.setThrottle(thrust_effort - yaw_effort);
-        esc_right.setThrottle(thrust_effort + yaw_effort);
+        esc_left.setThrottle((pitch_effort+1000)/2 - yaw_effort);
+        esc_right.setThrottle((pitch_effort+1000)/2 + yaw_effort);
         esc_left.update();
         esc_right.update();
     }
 
-    void safe_off() {
-        esc_left.safe_off();
-        esc_right.safe_off();
+    void arm() {
+        esc_left.init();
+        esc_right.init();
+        _arm = true;
+    }
+
+    void disarm() {
+        esc_left.safeOff();
+        esc_right.safeOff();
+        _arm = false;
+    }
+
+    bool isArmed() {
+        return _arm;
     }
 
 };
 
-
+/** Simple class for JSON communication over serial link */
 class Link {
 private:
     uint64_t heartbeat{0};
@@ -122,40 +130,47 @@ private:
     StaticJsonDocument<JSON_OBJECT_SIZE(10)> out;
 
 public:
-    JsonObject packet_in = in.to<JsonObject>();
-    JsonObject packet_out = out.to<JsonObject>();
 
-    Link() {}
-    
-    void send_packet(JsonObject& packet, const char* target="") {
+    JsonObject packet_in = in.to<JsonObject>();
+   
+    void sendPacket(JsonObject& packet, const char* target="") {
         packet["sender"] = "nucleo";
         packet["target"] = target;
         serializeJson(packet, buffer_out, sizeof(buffer_out));
         printf("%s\n", buffer_out);
     }
 
-    void send_ack() {
-        out.clear();
-        packet_out["ack"] = true;
-        send_packet(packet_out);
+    void sendAck() {
+        JsonObject packet_out = out.to<JsonObject>();
+        packet_out.clear();
+        packet_out["type"] = "ack";
+        sendPacket(packet_out);
     }
 
-    void send_log(const char* level, const char* msg, const char* echo="", const char* target="") {
-        out.clear();
+    void sendLog(const char* level, const char* msg, const char* echo="", const char* target="") {
+        JsonObject packet_out = out.to<JsonObject>();
+        packet_out["type"] = "log";
         packet_out["level"] = level;
         packet_out["log"] = msg;
         packet_out["echo"] = echo;
-        send_packet(packet_out);
+        sendPacket(packet_out);
     }
 
-    int get_packet() {
+    // TODO: fgets blocks if there is no serial data to read. Need to put it on a thread. Otherwise the control loop can hang.
+    int getPacket(const char* type) {
         if (serial.readable()) {
                 fgets(buffer_in, sizeof(buffer_in), stdin);
                 DeserializationError err = deserializeJson(in, buffer_in, sizeof(buffer_in));
                 if (err) {
-                    send_log("warning", "Msg recv: corrupt or unknown format", buffer_in);
-                } else if (strcmp(packet_in["target"], "nucleo")) {
-                    send_log("error", "Msg recv: wrong [target]");
+                    sendLog("debug", "Msg recv: corrupt or unknown format", buffer_in);
+
+                // TODO: these strcmp conditions are quite wasteful, consider using ID instead of strings
+                } else if (!packet_in.containsKey("target") || !packet_in["target"].is<const char*>() || strcmp(packet_in["target"], "nucleo")) {
+                    sendLog("debug", "Msg recv: wrong [target]");
+
+                } else if (!packet_in.containsKey("type") || !packet_in["type"].is<const char*>() || strcmp(packet_in["type"], type)) {
+                    sendLog("debug", "Packet recv: unexpected packet type");
+
                 } else {
                     return 0;
                 }
@@ -164,37 +179,39 @@ public:
     }
 };
 
-
+/** Global variables */
 PwmOut pwm[2] = {{PC_6}, {PC_8}};
 ESC esc[2] = {ESC(pwm[0]), ESC(pwm[1])};
 SUB sub(esc[0], esc[1]);
 Link link;
-
 int watchdog = 0;
-bool arm = false;
 
+/** Helper functions */
 void wd_reset() {
     watchdog = 10; // 10 cycles, about 1 secs
 }
 
+
+/** infinite loop until armed **/
 void handshake(Link& link) {
     while (true) {
-        int err = link.get_packet();
+        serial.sync();   // flush buffer from stale data
+        int err = link.getPacket("handshake");
         if (!err) {
-            arm = link.packet_in["arm"] | false;    // default to false if not exist
-            if (arm) {
-                sub.init();
-                for (int i = 0; i < 5; i++) {       // keep link activity to stabilize serial link, while waiting for esc to be ready
-                    link.get_packet();
-                    link.send_ack();
-                    wait_us(1*sec);
+            if (link.packet_in["arm"] | false) {    // default to false if not exist
+                sub.arm();
+                for (int i = 0; i < 50; i++) {       // keep link activity to stabilize serial link, while waiting for esc to be ready
+                    link.getPacket("handshake");
+                    wait_us(100*msec);
                 }
                 wd_reset();
-                link.send_log("info", "Ready to Rumble");
+                link.sendAck();
+                link.sendLog("info", "Armed");
+                break;
             }
         }
 
-        link.send_log("info", "Waiting for arm message");
+        link.sendLog("info", "Waiting for arm message");
         wait_us(1*sec);
     }
 }
@@ -202,36 +219,34 @@ void handshake(Link& link) {
 int main() {
     while(1) {
         //Handshaking at initialization
-        if (!arm) {
-            handshake(link);    
+        if (!sub.isArmed()) {
+            handshake(link);
         }
 
         // Control loop
-        int err = link.get_packet();
+        int err = link.getPacket("cmd");
         if (err) {
             // one period with wrong message
             watchdog--;
 
         } else {
-            int thrust = link.packet_in["thrust"] | 500;   //default to 500 if wrong value type
+            int pitch = link.packet_in["pitch"] | 500;   //default to 500 if wrong value type
             int yaw = link.packet_in["yaw"] | 0;         //default to 0 if key does not exist or wrong value type
-            sub.set_thrust_effort(thrust);
-            sub.set_yaw_effort(yaw);
+            sub.setPitchEffort(pitch);
+            sub.setYawEffort(yaw);
             sub.update();
             wd_reset();
-            link.send_ack();
+            link.sendAck();
         }
 
-        if (watchdog < 0) {        
-            sub.safe_off();
-            arm = false;    
-            link.send_log("error", "Watchdog: communication interrupted. Safe off triggered");
+        if (watchdog < 0) {   
+            sub.disarm();    
+            link.sendLog("info", "Watchdog: communication interrupted. Disarmed");
         }
 
-        if (link.packet_in["disarm"] == true) {                
-            sub.safe_off();
-            arm = false;
-            link.send_log("warn", "Safe off command received");
+        if (link.packet_in["disarm"] | false) {
+            sub.disarm();    
+            link.sendLog("warning", "Disarmed");
         }
 
         wait_us(100*msec); // 10Hz
