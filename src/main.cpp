@@ -171,12 +171,12 @@ public:
     }
 
 
-    void sendLog(const char* level, const char* msg, const char* echo="", const char* target="") {
+    void sendLog(const char* level, const char* msg, const char* echo=nullptr, const char* target="") {
         JsonObject packet_out = out.to<JsonObject>();
         packet_out["type"] = "log";
         packet_out["level"] = level;
         packet_out["log"] = msg;
-        packet_out["echo"] = echo;
+        if (echo) packet_out["echo"] = echo;
         sendPacket(packet_out);
     }
 
@@ -189,6 +189,7 @@ public:
                 sendLog("debug", "Msg recv: corrupt or unknown format", fgetsbuffer);
 
             // TODO: these strcmp conditions are quite wasteful, consider using ID instead of strings
+            // TODO: wrong type received can crash the board, consider doing type check on all receiving param
             } else if (!packet_in.containsKey("target") || !packet_in["target"].is<const char*>() || strcmp(packet_in["target"], "nucleo")) {
                 sendLog("debug", "Msg recv: wrong [target]");
 
