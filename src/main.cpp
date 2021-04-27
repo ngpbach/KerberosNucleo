@@ -10,6 +10,28 @@ FileHandle *mbed::mbed_override_console(int fd)     // necessary for printf, std
 const int sec = 1000000; // usec
 const int msec = 1000;   // usec
 
+
+/** Due to blocking nature of fgets, create a worker thread for it, and warn if it get blocked 
+ * If blocked for a long time it might be necessary to restart
+*/
+#define FGETS_START 1UL
+#define FGETS_DONE 2UL
+Thread thread{};
+EventFlags flag{};
+char fgetsbuffer[256]{};
+extern "C" void mbed_reset();
+void fgets_thread() {
+    while (true) {
+        flag.wait_any(FGETS_START);
+        if (serial.readable()) {
+            fgets(fgetsbuffer, sizeof(fgetsbuffer), stdin);
+            flag.set(FGETS_DONE);
+        } else {
+            flag.clear();
+        }
+    }
+}
+
 /** Simple class for ESC **/
 class ESC {    
 private:  
@@ -120,12 +142,11 @@ public:
 
 };
 
+
 /** Simple class for JSON communication over serial link */
 class Link {
 private:
-    uint64_t heartbeat{0};
-    char buffer_in[256];
-    char buffer_out[256];
+    uint64_t count{0};
     StaticJsonDocument<JSON_OBJECT_SIZE(10)> in;        // max 10 key-value pairs
     StaticJsonDocument<JSON_OBJECT_SIZE(10)> out;
 
@@ -134,18 +155,21 @@ public:
     JsonObject packet_in = in.to<JsonObject>();
    
     void sendPacket(JsonObject& packet, const char* target="") {
+        static char buffer[256];
         packet["sender"] = "nucleo";
         packet["target"] = target;
-        serializeJson(packet, buffer_out, sizeof(buffer_out));
-        printf("%s\n", buffer_out);
+        packet["count"] = count++;
+        serializeJson(packet, buffer, sizeof(buffer));
+        printf("%s\n", buffer);
     }
 
-    void sendAck() {
+    void sendAck(bool arm) {
         JsonObject packet_out = out.to<JsonObject>();
-        packet_out.clear();
         packet_out["type"] = "ack";
+        packet_out["arm"] = arm;
         sendPacket(packet_out);
     }
+
 
     void sendLog(const char* level, const char* msg, const char* echo="", const char* target="") {
         JsonObject packet_out = out.to<JsonObject>();
@@ -156,25 +180,30 @@ public:
         sendPacket(packet_out);
     }
 
-    // TODO: fgets blocks if there is no serial data to read. Need to put it on a thread. Otherwise the control loop can hang.
     int getPacket(const char* type) {
-        if (serial.readable()) {
-                fgets(buffer_in, sizeof(buffer_in), stdin);
-                DeserializationError err = deserializeJson(in, buffer_in, sizeof(buffer_in));
-                if (err) {
-                    sendLog("debug", "Msg recv: corrupt or unknown format", buffer_in);
+        flag.set(FGETS_START);
+        uint32_t ret = flag.wait_any(FGETS_DONE,10);
+        if (ret == FGETS_DONE) {            
+            DeserializationError err = deserializeJson(in, fgetsbuffer, sizeof(fgetsbuffer));
+            if (err) {
+                sendLog("debug", "Msg recv: corrupt or unknown format", fgetsbuffer);
 
-                // TODO: these strcmp conditions are quite wasteful, consider using ID instead of strings
-                } else if (!packet_in.containsKey("target") || !packet_in["target"].is<const char*>() || strcmp(packet_in["target"], "nucleo")) {
-                    sendLog("debug", "Msg recv: wrong [target]");
+            // TODO: these strcmp conditions are quite wasteful, consider using ID instead of strings
+            } else if (!packet_in.containsKey("target") || !packet_in["target"].is<const char*>() || strcmp(packet_in["target"], "nucleo")) {
+                sendLog("debug", "Msg recv: wrong [target]");
 
-                } else if (!packet_in.containsKey("type") || !packet_in["type"].is<const char*>() || strcmp(packet_in["type"], type)) {
-                    sendLog("debug", "Packet recv: unexpected packet type");
+            } else if (!packet_in.containsKey("type") || !packet_in["type"].is<const char*>() || strcmp(packet_in["type"], type)) {
+                sendLog("debug", "Packet recv: unexpected packet type");
 
-                } else {
-                    return 0;
-                }
+            } else {
+                return 0;
+            }
+
+        } else if (ret == FGETS_START) {                    
+            sendLog("critical", "fgets() got stuck, try sending '\\n' char");
+            // TODO: use mbed_reset() if certain time pass
         }
+
         return -1;
     }
 };
@@ -191,21 +220,27 @@ void wd_reset() {
     watchdog = 10; // 10 cycles, about 1 secs
 }
 
+/** blinky */
+void blink() {
+    static DigitalOut led(LED1);
+    led = !led;
+}
 
 /** infinite loop until armed **/
 void handshake(Link& link) {
+    serial.sync();   // flush buffer from stale data
     while (true) {
-        serial.sync();   // flush buffer from stale data
-        int err = link.getPacket("handshake");
+        int err = link.getPacket("cmd");
         if (!err) {
             if (link.packet_in["arm"] | false) {    // default to false if not exist
                 sub.arm();
-                for (int i = 0; i < 50; i++) {       // keep link activity to stabilize serial link, while waiting for esc to be ready
-                    link.getPacket("handshake");
+                for (int i = 0; i < 10; i++) {       // keep link activity to stabilize serial link, while waiting for esc to be ready
+                    link.getPacket("cmd");
+                    link.sendAck(false);
                     wait_us(100*msec);
                 }
                 wd_reset();
-                link.sendAck();
+                link.sendAck(sub.isArmed());
                 link.sendLog("info", "Armed");
                 break;
             }
@@ -217,6 +252,7 @@ void handshake(Link& link) {
 }
 
 int main() {
+    thread.start(callback(fgets_thread));
     while(1) {
         //Handshaking at initialization
         if (!sub.isArmed()) {
@@ -229,6 +265,11 @@ int main() {
             // one period with wrong message
             watchdog--;
 
+        } else if (link.packet_in["disarm"] | false) {
+            sub.disarm();    
+            link.sendAck(sub.isArmed());
+            link.sendLog("info", "Disarmed");
+
         } else {
             int pitch = link.packet_in["pitch"] | 500;   //default to 500 if wrong value type
             int yaw = link.packet_in["yaw"] | 0;         //default to 0 if key does not exist or wrong value type
@@ -236,19 +277,15 @@ int main() {
             sub.setYawEffort(yaw);
             sub.update();
             wd_reset();
-            link.sendAck();
+            link.sendAck(sub.isArmed());
         }
 
         if (watchdog < 0) {   
-            sub.disarm();    
+            sub.disarm();
             link.sendLog("info", "Watchdog: communication interrupted. Disarmed");
         }
 
-        if (link.packet_in["disarm"] | false) {
-            sub.disarm();    
-            link.sendLog("warning", "Disarmed");
-        }
-
+        blink();
         wait_us(100*msec); // 10Hz
     }
 
