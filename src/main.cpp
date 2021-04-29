@@ -156,7 +156,7 @@ public:
    
     void sendPacket(JsonObject& packet, const char* target="") {
         static char buffer[256];
-        packet["sender"] = "nucleo";
+        packet["origin"] = "nucleo";
         packet["target"] = target;
         packet["count"] = count++;
         serializeJson(packet, buffer, sizeof(buffer));
@@ -168,6 +168,10 @@ public:
         packet_out["type"] = "ack";
         packet_out["arm"] = arm;
         sendPacket(packet_out);
+    }
+
+    void sendFeedback() {
+        // TODO: periodic sensor feedback
     }
 
 
@@ -189,7 +193,6 @@ public:
                 sendLog("debug", "Msg recv: corrupt or unknown format", fgetsbuffer);
 
             // TODO: these strcmp conditions are quite wasteful, consider using ID instead of strings
-            // TODO: wrong type received can crash the board, consider doing type check on all receiving param
             } else if (!packet_in.containsKey("target") || !packet_in["target"].is<const char*>() || strcmp(packet_in["target"], "nucleo")) {
                 sendLog("debug", "Msg recv: wrong [target]");
 
